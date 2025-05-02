@@ -1,29 +1,42 @@
 import cv2
 import mediapipe as mp
+import requests
 import numpy as np
 import tensorflow as tf
+import time
 from tensorflow.keras.models import load_model
 
 # Initialize MediaPipe Face Detection
 mp_face_detection = mp.solutions.face_detection
 mp_draw = mp.solutions.drawing_utils
 
+#Replace with your ESP32-CAM's IP Address
+ESP32_CAM_IP = "192.168.156.198"
+ESP32_CAM_STREAM_URL = f"http://{ESP32_CAM_IP}:81/stream"
+ESP32_CAM_START_STREAM_URL = f"http://{ESP32_CAM_IP}/control?var=enable&val=1"
+
+# Start the ESP32-CAM stream automatically
+print("Starting ESP32-CAM stream...")
+requests.get(ESP32_CAM_START_STREAM_URL)
+time.sleep(2)  # Allow time for the stream to start
+
 # Load Pre-trained Gender Classification Model
 model = load_model("gender_model.h5", compile=False)  # Load your trained model
 class_names = ["Female", "Male"]
 
-# Knowledge Representation: Track Unique Faces
-unique_men = set()
-unique_women = set()
+# Tracking Dictionaries
+pending_faces = {}  # Temporarily stores detected faces for delay
+tracked_faces = {}  # Stores confirmed unique faces
 
 # Initialize Webcam
-cap = cv2.VideoCapture(0)
+cap = cv2.VideoCapture(ESP32_CAM_STREAM_URL)
 
 def preprocess_face(face_img):
     """Preprocesses the face image before passing it to the model."""
-    face_img = cv2.resize(face_img, (64, 64))  # Resize to model's input size
-    face_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)  # Ensure correct color channels
-    face_img = np.expand_dims(face_img / 255.0, axis=0)  # Normalize and expand dimensions
+    face_img = cv2.resize(face_img, (64, 64))
+    face_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+    face_img = np.expand_dims(face_img / 255.0, axis=0)
+    face_img = face_img / 255.0  # Normalize
     return face_img
 
 def classify_gender(face_img):
@@ -31,20 +44,31 @@ def classify_gender(face_img):
     face_img = preprocess_face(face_img)
     prediction = model.predict(face_img)
 
-    # Handle output structure
     if isinstance(prediction, list):
-        prediction = prediction[0]  # Extract array from list if needed
-    prediction = np.array(prediction).flatten()  # Flatten if necessary
-    gender = class_names[np.argmax(prediction)]  # Determine gender
+        prediction = prediction[0]
+    prediction = np.array(prediction).flatten()
+    gender = class_names[np.argmax(prediction)]
     return gender
 
-def is_new_face(existing_faces, new_face_box, threshold=30):
-    """Checks if a detected face is new based on bounding box coordinates."""
-    x, y, w_box, h_box = new_face_box
-    for (ex, ey, ew, eh) in existing_faces:
-        if abs(ex - x) < threshold and abs(ey - y) < threshold:
-            return False  # Face already detected within proximity
-    return True  # New face detected
+def is_new_face(face_id, gender, delay_time=0, expiration_time=150):
+    """Delays counting a face until it's been detected consistently for a set time."""
+    global pending_faces, tracked_faces
+    current_time = time.time()
+
+    # Remove expired face IDs
+    tracked_faces = {k: v for k, v in tracked_faces.items() if current_time - v["timestamp"] < expiration_time}
+
+    # Store the detected face temporarily
+    if face_id not in pending_faces:
+        pending_faces[face_id] = {"gender": gender, "timestamp": current_time}
+        return False  # Not counted yet (waiting)
+
+    # If face has been in pending state for `delay_time` seconds, move it to tracked_faces
+    if current_time - pending_faces[face_id]["timestamp"] >= delay_time:
+        tracked_faces[face_id] = pending_faces.pop(face_id)  # Confirm as unique
+        return True  # Now counted as a unique face
+
+    return False  # Still waiting to confirm uniqueness
 
 # Start Webcam Feed
 with mp_face_detection.FaceDetection(min_detection_confidence=0.5) as face_detection:
@@ -68,23 +92,24 @@ with mp_face_detection.FaceDetection(min_detection_confidence=0.5) as face_detec
                 if face_img.size == 0 or w_box < 10 or h_box < 10:
                     continue
 
-                # Classify gender
                 gender = classify_gender(face_img)
+                face_id = hash((x, y, w_box, h_box))  # Unique identifier for faces
 
-                # Check if it's a new face before updating counts
-                if gender == "Male" and is_new_face(unique_men, (x, y, w_box, h_box)):
-                    unique_men.add((x, y, w_box, h_box))
-                elif gender == "Female" and is_new_face(unique_women, (x, y, w_box, h_box)):
-                    unique_women.add((x, y, w_box, h_box))
+                if is_new_face(face_id, gender):
+                    cv2.putText(frame, f"New {gender} detected!", (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
                 # Draw bounding box & label with background
                 cv2.rectangle(frame, (x, y - 35), (x + w_box, y), (0, 0, 0), -1)
                 cv2.putText(frame, gender, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
                 cv2.rectangle(frame, (x, y), (x + w_box, y + h_box), (0, 255, 0), 2)
 
-        # Display the unique counts
-        cv2.putText(frame, f"Unique Male: {len(unique_men)}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-        cv2.putText(frame, f"Unique Female: {len(unique_women)}", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 255), 2)
+        # Count the number of unique males and females
+        male_count = sum(1 for g in tracked_faces.values() if g["gender"] == "Male")
+        female_count = sum(1 for g in tracked_faces.values() if g["gender"] == "Female")
+
+        # Display unique counts
+        cv2.putText(frame, f"Unique Male: {male_count}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+        cv2.putText(frame, f"Unique Female: {female_count}", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 255), 2)
 
         cv2.imshow('Gender Classification', frame)
 
